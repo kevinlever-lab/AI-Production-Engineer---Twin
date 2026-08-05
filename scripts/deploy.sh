@@ -41,7 +41,7 @@ AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 # Use the DEFAULT_AWS_REGION environment variable if set, otherwise fall back
 # to us-east-1. Must match the region where the S3 bucket and DynamoDB table
 # were created by backend-setup.tf.
-AWS_REGION=${DEFAULT_AWS_REGION:-us-east-1}
+AWS_REGION=${DEFAULT_AWS_REGION:-ap-southeast-2}
 # -input=false prevents Terraform from prompting for missing variables
 #  interactively — required for non-interactive CI/CD runs.
 # Each -backend-config flag supplies one backend setting at init time,
