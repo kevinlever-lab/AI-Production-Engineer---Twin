@@ -21,9 +21,46 @@ echo "📦 Building Lambda package..."
 
 # 2. Terraform workspace & apply
 cd terraform
+
 # Initialize Terraform (download providers/modules) without prompting for input,
 # so this script can run non-interactively (e.g. in CI)
-terraform init -input=false
+# The following is the initial command before using GitHub Actions. It is used to initialize the Terraform configuration.
+# terraform init -input=false
+
+# The following is the revised command for using GitHub Actions. We have created an AWS S3 bucket and DynamoDB to record state and locks. It is used to initialize the Terraform configuration.
+# Initialise Terraform with the remote S3 backend for the target environment.
+#
+# Backend configuration is passed at runtime via -backend-config flags rather
+# than hardcoded in a .tf file, so the same configuration can be reused across
+# environments and AWS accounts without modification.
+
+# Retrieve the AWS account ID of the currently authenticated IAM identity.
+# Used to construct the state bucket name, which embeds the account ID for
+# global uniqueness (matches the name set in backend-setup.tf).
+AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+# Use the DEFAULT_AWS_REGION environment variable if set, otherwise fall back
+# to us-east-1. Must match the region where the S3 bucket and DynamoDB table
+# were created by backend-setup.tf.
+AWS_REGION=${DEFAULT_AWS_REGION:-us-east-1}
+# -input=false prevents Terraform from prompting for missing variables
+#  interactively — required for non-interactive CI/CD runs.
+# Each -backend-config flag supplies one backend setting at init time,
+# keeping environment-specific values out of committed .tf files.
+# Line 2 below is the S3 bucket that stores all Terraform state files (created in backend-setup.tf).
+# Account ID is embedded in the name to guarantee global uniqueness.
+# Line 3 below is the state file path within the bucket. Using the environment name as a prefix
+# isolates each workspace's state: dev/terraform.tfstate, prod/terraform.tfstate, etc.
+# Line 4 below is the AWS region where the S3 bucket and DynamoDB lock table reside.
+# Line 5 below is the DynamoDB table used for state locking — prevents concurrent terraform runs
+# from corrupting the shared state file (created in backend-setup.tf).
+# Line 6 below is the Enforce server-side AES-256 encryption on the state file at rest,
+# matching the encryption configuration set on the S3 bucket in backend-setup.tf.
+terraform init -input=false \
+  -backend-config="bucket=twin-terraform-state-${AWS_ACCOUNT_ID}" \
+  -backend-config="key=${ENVIRONMENT}/terraform.tfstate" \
+  -backend-config="region=${AWS_REGION}" \
+  -backend-config="dynamodb_table=twin-terraform-locks" \
+  -backend-config="encrypt=true"
 
 # Terraform workspaces isolate state per environment (dev/test/prod).
 # Create the workspace if it doesn't exist yet, otherwise just switch to it.

@@ -1,0 +1,133 @@
+# destroy.yml
+# GitHub Actions workflow that tears down all AWS infrastructure for a
+# specified environment. Manual trigger only — this workflow cannot be
+# triggered by a code push, preventing accidental destruction.
+#
+# A confirmation step requires the operator to type the environment name
+# before any destructive actions are taken, providing a human safety check
+# against accidental or unintended teardowns.
+#
+# Destruction sequence:
+#   1. Verify the typed confirmation matches the selected environment
+#   2. Authenticate with AWS via OIDC
+#   3. Empty S3 buckets (required before Terraform can delete them)
+#   4. Run terraform destroy against the target workspace
+#
+# Required GitHub secrets:
+#   AWS_ROLE_ARN          - ARN of the IAM role to assume (from github_oidc.tf output)
+#   AWS_ACCOUNT_ID        - AWS account ID (used to construct S3 bucket names)
+#   DEFAULT_AWS_REGION    - AWS region where infrastructure is deployed
+#
+# WARNING: This workflow permanently deletes all infrastructure and data
+#          for the target environment. This action is irreversible.
+
+name: Destroy Environment
+
+on:
+  # Manual trigger only — no automatic execution on push or schedule.
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to destroy'
+        required: true
+        type: choice
+        options:
+          - dev
+          - test
+          - prod
+      # Secondary confirmation input — the operator must type the environment
+      # name exactly to proceed. Compared against the selected environment in
+      # the "Verify confirmation" step
+      confirm:
+        description: 'Type the environment name to confirm destruction'
+        required: true
+
+# Grant the minimum permissions required for OIDC authentication and checkout.
+# id-token: write  — allows the workflow to request a JWT from GitHub's OIDC
+#                    provider to exchange for temporary AWS credentials.
+# contents: read   — allows the workflow to check out repository code.
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  destroy:
+    # Job name shown in the GitHub Actions UI — includes the target environment
+    # so it's immediately clear which environment is being destroyed.
+    name: Destroy ${{ github.event.inputs.environment }}
+    runs-on: ubuntu-latest
+    # Links this job to the GitHub environment (dev/test/prod), enabling
+    # environment-specific secrets and optional manual approval gates
+    # configured under Settings → Environments in the GitHub repo.
+    # For prod, consider adding a required reviewer here as an extra safeguard.
+    environment: ${{ github.event.inputs.environment }}
+    
+    steps:
+      # Safety gate — must pass before any AWS or Terraform commands run.
+      # Compares the free-text confirmation input against the selected
+      # environment name. If they don't match exactly (case-sensitive),
+      # the workflow exits immediately with a clear error message and
+      # no infrastructure is touched.
+      - name: Verify confirmation
+        run: |
+          if [ "${{ github.event.inputs.confirm }}" != "${{ github.event.inputs.environment }}" ]; then
+            echo "❌ Confirmation does not match environment name!"
+            echo "You entered: '${{ github.event.inputs.confirm }}'"
+            echo "Expected: '${{ github.event.inputs.environment }}'"
+            exit 1
+          fi
+          echo "✅ Destruction confirmed for ${{ github.event.inputs.environment }}"
+
+      # Check out the repository so the destroy script and Terraform
+      # configuration files are available to subsequent steps.
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Authenticate with AWS using OIDC federation — no long-lived AWS access
+      # keys stored as secrets. GitHub generates a short-lived JWT; AWS validates
+      # it against the OIDC provider registered in github_oidc.tf and issues
+      # temporary credentials scoped to AWS_ROLE_ARN for this run only.
+      # role-session-name appears in AWS CloudTrail logs for audit traceability.
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: github-actions-destroy
+          aws-region: ${{ secrets.DEFAULT_AWS_REGION }}
+
+      # Install Terraform CLI for running the destroy plan.
+      # terraform_wrapper: false disables the wrapper script added by this
+      # action by default — the wrapper interferes with capturing raw
+      # terraform output values and is not needed for destroy operations.
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false  # Important: disable wrapper to get raw outputs
+
+      # Run the destroy script which handles the full teardown sequence:
+      #   1. Initialises Terraform with the remote S3 backend
+      #   2. Selects the target workspace
+      #   3. Empties S3 buckets (AWS blocks deletion of non-empty buckets)
+      #   4. Runs terraform destroy with auto-approve
+      #
+      # AWS_ACCOUNT_ID and DEFAULT_AWS_REGION are exported so the script
+      # can reconstruct S3 bucket names and configure the Terraform backend
+      # without needing them hardcoded.
+      - name: Run Destroy Script
+        run: |
+          # Set environment variables for the script
+          export AWS_ACCOUNT_ID=${{ secrets.AWS_ACCOUNT_ID }}
+          export DEFAULT_AWS_REGION=${{ secrets.DEFAULT_AWS_REGION }}
+          
+          # Make script executable and run it
+          chmod +x scripts/destroy.sh
+          ./scripts/destroy.sh ${{ github.event.inputs.environment }}
+        env:
+          AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+
+      # Final confirmation printed to the workflow run log.
+      # If this step is reached, all prior steps completed without error,
+      # meaning the environment has been fully destroyed.
+      - name: Destruction Complete
+        run: |
+          echo "✅ Environment ${{ github.event.inputs.environment }} has been destroyed!"

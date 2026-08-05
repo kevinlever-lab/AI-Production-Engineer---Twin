@@ -1,0 +1,174 @@
+# deploy.yml
+# GitHub Actions workflow that builds and deploys the Digital Twin application
+# to AWS. Triggered automatically on every push to main, or manually via the
+# GitHub Actions UI for targeted environment deployments.
+#
+# Deployment sequence:
+#   1. Authenticate with AWS via OIDC (no stored credentials)
+#   2. Build the Lambda package (Python/uv) and frontend (Node.js/npm)
+#   3. Apply Terraform to provision/update infrastructure
+#   4. Upload frontend assets to S3
+#   5. Invalidate CloudFront cache so users get the latest frontend immediately
+#
+# Required GitHub secrets:
+#   AWS_ROLE_ARN          - ARN of the IAM role to assume (from github_oidc.tf output)
+#   AWS_ACCOUNT_ID        - AWS account ID (used to construct resource names)
+#   DEFAULT_AWS_REGION    - AWS region where infrastructure is deployed
+
+name: Deploy Digital Twin
+
+on:
+  # Automatically deploy to dev on every push to main.
+  push:
+    branches: [main]
+  # Allow manual deploys to any environment via the GitHub Actions UI.
+  # Useful for promoting a build to test/prod without pushing new code.
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - test
+          - prod
+
+# Grant the OIDC token permission to authenticate with AWS.
+# id-token: write  — allows the workflow to request a JWT from GitHub's OIDC provider,
+#                    which is then exchanged for temporary AWS credentials.
+# contents: read   — allows the workflow to check out the repository code.
+# No other permissions are granted — principle of least privilege.
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    # Job name shown in the GitHub Actions UI — includes the target environment
+    # so it's clear at a glance which environment a run is targeting.
+    name: Deploy to ${{ github.event.inputs.environment || 'dev' }}
+    runs-on: ubuntu-latest
+    # Links this job to a GitHub environment (dev/test/prod), enabling
+    # environment-specific secrets and optional manual approval gates
+    # configured under Settings → Environments in the GitHub repo.
+    environment: ${{ github.event.inputs.environment || 'dev' }}
+    
+    steps:
+      # Check out the repository at the commit that triggered the workflow,
+      # making all source files available to subsequent steps.
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Authenticate with AWS using OIDC federation — no AWS access keys stored
+      # as secrets. GitHub generates a short-lived JWT; AWS validates it against
+      # the OIDC provider registered in github_oidc.tf and issues temporary
+      # credentials scoped to AWS_ROLE_ARN for this workflow run only.
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: github-actions-deploy
+          aws-region: ${{ secrets.DEFAULT_AWS_REGION }}
+
+      # Install Python 3.12 to match the Lambda runtime version used in
+      # backend/deploy.py and the Lambda function itself (public.ecr.aws/lambda/python:3.12).
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # Install uv — the fast Python package manager used by the Lambda build
+      # script (backend/deploy.py) to install dependencies into the deployment
+      # package. Adding ~/.local/bin to GITHUB_PATH makes the `uv` binary
+      # available to all subsequent steps without needing the full path.
+      - name: Install uv
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      # Install Terraform CLI for infrastructure provisioning.
+      # terraform_wrapper: false disables the wrapper script that hashicorp's
+      # action adds by default — the wrapper interferes with capturing raw
+      # `terraform output` values in later steps, so it must be disabled here.
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false  # Important: disable wrapper to get raw outputs
+
+      # Install Node.js 20 for building the frontend.
+      # cache: 'npm' caches node_modules between runs based on the package-lock.json
+      # hash, significantly speeding up installs when dependencies haven't changed.
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      # Run the main deployment script which orchestrates the full deploy:
+      # Lambda package build → Terraform init/apply → frontend S3 sync.
+      # AWS_ACCOUNT_ID and DEFAULT_AWS_REGION are exported as environment
+      # variables so deploy.sh and the terraform backend init can reference
+      # them for constructing resource names and backend config.
+      - name: Run Deployment Script
+        run: |
+          # Set environment variables for the script
+          export AWS_ACCOUNT_ID=${{ secrets.AWS_ACCOUNT_ID }}
+          export DEFAULT_AWS_REGION=${{ secrets.DEFAULT_AWS_REGION }}
+          
+          # Make script executable and run it
+          chmod +x scripts/deploy.sh
+          ./scripts/deploy.sh ${{ github.event.inputs.environment || 'dev' }}
+        env:
+          AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+
+      # Read Terraform outputs after the deployment so subsequent steps can
+      # reference the live resource URLs and names without hardcoding them.
+      # id: deploy_outputs makes these values accessible to later steps as
+      # ${{ steps.deploy_outputs.outputs.<key> }}.
+      # terraform_wrapper must be false (set above) for -raw output to work
+      # correctly — the wrapper adds extra characters that break string capture.          
+      - name: Get Deployment URLs
+        id: deploy_outputs
+        working-directory: ./terraform
+        run: |
+          terraform workspace select ${{ github.event.inputs.environment || 'dev' }}
+          echo "cloudfront_url=$(terraform output -raw cloudfront_url)" >> $GITHUB_OUTPUT
+          echo "api_url=$(terraform output -raw api_gateway_url)" >> $GITHUB_OUTPUT
+          echo "frontend_bucket=$(terraform output -raw s3_frontend_bucket)" >> $GITHUB_OUTPUT
+
+      # Invalidate the CloudFront cache after the frontend S3 sync so users
+      # receive the newly deployed assets immediately, rather than waiting for
+      # the CDN's TTL to expire naturally.
+      #
+      # The distribution is looked up dynamically by matching its origin domain
+      # to the frontend S3 bucket name, rather than storing the distribution ID
+      # as a secret — this keeps the workflow self-contained and works even if
+      # the distribution is recreated with a new ID by Terraform.
+      #
+      # "/*" invalidates all cached paths. The existence check (!= "None")
+      # prevents the step from failing in environments where CloudFront hasn't
+      # been provisioned yet (e.g. a freshly created dev environment).
+      - name: Invalidate CloudFront
+        run: |
+          DISTRIBUTION_ID=$(aws cloudfront list-distributions \
+            --query "DistributionList.Items[?Origins.Items[?DomainName=='${{ steps.deploy_outputs.outputs.frontend_bucket }}.s3-website-${{ secrets.DEFAULT_AWS_REGION }}.amazonaws.com']].Id | [0]" \
+            --output text)
+          
+          if [ "$DISTRIBUTION_ID" != "None" ] && [ -n "$DISTRIBUTION_ID" ]; then
+            aws cloudfront create-invalidation \
+              --distribution-id $DISTRIBUTION_ID \
+              --paths "/*"
+          fi
+
+      # Print a deployment summary to the workflow run log so the deployed
+      # URLs are immediately visible in the GitHub Actions UI without needing
+      # to open the AWS console.
+      - name: Deployment Summary
+        run: |
+          echo "✅ Deployment Complete!"
+          echo "🌐 CloudFront URL: ${{ steps.deploy_outputs.outputs.cloudfront_url }}"
+          echo "📡 API Gateway: ${{ steps.deploy_outputs.outputs.api_url }}"
+          echo "🪣 Frontend Bucket: ${{ steps.deploy_outputs.outputs.frontend_bucket }}"
