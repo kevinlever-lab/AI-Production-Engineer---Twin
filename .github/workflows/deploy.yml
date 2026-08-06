@@ -74,8 +74,8 @@ jobs:
 
       # Temporary debugging step
       - name: Dump OIDC claims
-         shell: bash
-         run: |
+        shell: bash
+        run: |
            echo "Requesting OIDC token..."
 
            TOKEN=$(curl -s \
