@@ -89,11 +89,12 @@ jobs:
       # temporary credentials scoped to AWS_ROLE_ARN for this run only.
       # role-session-name appears in AWS CloudTrail logs for audit traceability.
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@v5
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           role-session-name: github-actions-destroy
           aws-region: ${{ secrets.DEFAULT_AWS_REGION }}
+          audience: sts.amazonaws.com
 
       # Install Terraform CLI for running the destroy plan.
       # terraform_wrapper: false disables the wrapper script added by this
