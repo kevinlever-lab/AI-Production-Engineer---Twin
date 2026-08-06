@@ -61,6 +61,24 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      # Claude test script to check credentials.
+      - name: Debug OIDC Token
+        run: |
+          TOKEN=$(curl -s -H "Authorization: bearer ${{ secrets.ACTIONS_ID_TOKEN_REQUEST_TOKEN }}" \
+            "${{ secrets.ACTIONS_ID_TOKEN_REQUEST_URL }}&audience=sts.amazonaws.com")
+          echo $TOKEN | python3 -c "
+            import sys, json, base64
+            token = json.load(sys.stdin)['value']
+            payload = token.split('.')[1]
+            payload += '=' * (4 - len(payload) % 4)
+            decoded = json.loads(base64.b64decode(payload))
+            print('sub:', decoded.get('sub'))
+            print('aud:', decoded.get('aud'))
+            print('iss:', decoded.get('iss'))
+          "
+
+
+
       # Authenticate with AWS using OIDC federation — no AWS access keys stored
       # as secrets. GitHub generates a short-lived JWT; AWS validates it against
       # the OIDC provider registered in github_oidc.tf and issues temporary
