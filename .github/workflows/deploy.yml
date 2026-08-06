@@ -73,7 +73,7 @@ jobs:
           echo "Actor      : ${{ github.actor }}"
 
       # Temporary debugging step
-       - name: Dump OIDC claims
+      - name: Dump OIDC claims
          shell: bash
          run: |
            echo "Requesting OIDC token..."
