@@ -72,17 +72,32 @@ jobs:
           echo "Environment: ${{ github.event.inputs.environment || 'dev' }}"
           echo "Actor      : ${{ github.actor }}"
 
+      # Temporary debugging step
+       - name: Dump OIDC claims
+         shell: bash
+         run: |
+           echo "Requesting OIDC token..."
+
+           TOKEN=$(curl -s \
+              -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+              "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sts.amazonaws.com" \
+              | jq -r '.value')
+
+            echo "$TOKEN" | cut -d '.' -f2 | base64 -d 2>/dev/null | jq .
 
       # Authenticate with AWS using OIDC federation — no AWS access keys stored
       # as secrets. GitHub generates a short-lived JWT; AWS validates it against
       # the OIDC provider registered in github_oidc.tf and issues temporary
       # credentials scoped to AWS_ROLE_ARN for this workflow run only.
+      # Changed uses: aws-actions/configure-aws-credentials@v4 to that below
+      # also added audience: sts.amazonaws.com
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@v5
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           role-session-name: github-actions-deploy
           aws-region: ${{ secrets.DEFAULT_AWS_REGION }}
+          audience: sts.amazonaws.com
 
       # Install Python 3.12 to match the Lambda runtime version used in
       # backend/deploy.py and the Lambda function itself (public.ecr.aws/lambda/python:3.12).
