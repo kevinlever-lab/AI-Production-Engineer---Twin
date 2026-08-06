@@ -61,6 +61,18 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      # Temporary debugging step
+      - name: Show GitHub context
+        run: |
+          echo "Repository : ${{ github.repository }}"
+          echo "Owner      : ${{ github.repository_owner }}"
+          echo "Ref        : ${{ github.ref }}"
+          echo "Branch     : ${{ github.ref_name }}"
+          echo "Event      : ${{ github.event_name }}"
+          echo "Environment: ${{ github.event.inputs.environment || 'dev' }}"
+          echo "Actor      : ${{ github.actor }}"
+
+
       # Authenticate with AWS using OIDC federation — no AWS access keys stored
       # as secrets. GitHub generates a short-lived JWT; AWS validates it against
       # the OIDC provider registered in github_oidc.tf and issues temporary
